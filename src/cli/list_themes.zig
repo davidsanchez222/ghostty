@@ -259,6 +259,24 @@ const Preview = struct {
     text_input: vaxis.widgets.TextInput,
     theme_filter: ColorScheme,
 
+    /// Result of the last `w` on the save screen, shown next to the
+    /// `config-file` line.
+    save_status: enum {
+        none,
+        written,
+        write_failed,
+    } = .none,
+
+    /// Result of the last `c` or `C` on the save screen, shown next to
+    /// the line that was copied.
+    copy_status: enum {
+        none,
+        theme_copied,
+        theme_failed,
+        config_copied,
+        config_failed,
+    } = .none,
+
     pub fn init(
         allocator: std.mem.Allocator,
         themes: []ThemeListElement,
@@ -458,8 +476,11 @@ const Preview = struct {
                             self.mode = .help;
                         if (key.matches('/', .{}))
                             self.mode = .search;
-                        if (key.matchesAny(&.{ vaxis.Key.enter, vaxis.Key.kp_enter }, .{}))
+                        if (key.matchesAny(&.{ vaxis.Key.enter, vaxis.Key.kp_enter }, .{})) {
+                            self.save_status = .none;
+                            self.copy_status = .none;
                             self.mode = .save;
+                        }
                         if (key.matchesAny(&.{ 'x', '/' }, .{ .ctrl = true })) {
                             self.text_input.buf.clearRetainingCapacity();
                             try self.updateFiltered();
@@ -470,11 +491,13 @@ const Preview = struct {
                             self.current = self.filtered.items.len - 1;
                         if (key.matchesAny(&.{ 'j', '+', vaxis.Key.down, vaxis.Key.kp_down, vaxis.Key.kp_add }, .{}))
                             self.down(1);
-                        if (key.matchesAny(&.{ vaxis.Key.page_down, vaxis.Key.kp_down }, .{}))
+                        if (key.matchesAny(&.{ vaxis.Key.page_down, vaxis.Key.kp_page_down }, .{}) or
+                            key.matches('d', .{ .ctrl = true }))
                             self.down(20);
                         if (key.matchesAny(&.{ 'k', '-', vaxis.Key.up, vaxis.Key.kp_up, vaxis.Key.kp_subtract }, .{}))
                             self.up(1);
-                        if (key.matchesAny(&.{ vaxis.Key.page_up, vaxis.Key.kp_page_up }, .{}))
+                        if (key.matchesAny(&.{ vaxis.Key.page_up, vaxis.Key.kp_page_up }, .{}) or
+                            key.matches('u', .{ .ctrl = true }))
                             self.up(20);
                         if (key.matchesAny(&.{ 'h', 'x' }, .{}))
                             self.hex = true;
@@ -528,7 +551,35 @@ const Preview = struct {
                         if (key.matchesAny(&.{ vaxis.Key.escape, vaxis.Key.enter, vaxis.Key.kp_enter }, .{}))
                             self.mode = .normal;
                         if (key.matches('w', .{})) {
+                            self.copy_status = .none;
                             self.saveSelectedTheme();
+                        }
+                        if (key.matches('c', .{})) {
+                            const line = try std.fmt.allocPrint(
+                                alloc,
+                                "theme = {s}",
+                                .{self.themes[self.filtered.items[self.current]].theme},
+                            );
+                            defer alloc.free(line);
+                            self.copy_status = .theme_copied;
+                            self.vx.copyToSystemClipboard(
+                                self.tty.writer(),
+                                line,
+                                alloc,
+                            ) catch {
+                                self.copy_status = .theme_failed;
+                            };
+                        }
+                        if (key.matches('c', .{ .shift = true })) {
+                            self.save_status = .none;
+                            self.copy_status = .config_copied;
+                            self.vx.copyToSystemClipboard(
+                                self.tty.writer(),
+                                "config-file = ?auto/theme.ghostty",
+                                alloc,
+                            ) catch {
+                                self.copy_status = .config_failed;
+                            };
                         }
                     },
                 }
@@ -749,7 +800,7 @@ const Preview = struct {
             .help => {
                 win.hideCursor();
                 const width = 60;
-                const height = 22;
+                const height = 24;
                 const child = win.child(
                     .{
                         .x_off = win.width / 2 -| width / 2,
@@ -771,10 +822,10 @@ const Preview = struct {
                     .{ .keys = "f", .help = "Cycle through theme filters." },
                     .{ .keys = "k, ↑", .help = "Move up 1 theme." },
                     .{ .keys = "ScrollUp", .help = "Move up 1 theme." },
-                    .{ .keys = "PgUp", .help = "Move up 20 themes." },
+                    .{ .keys = "PgUp, ^U", .help = "Move up 20 themes." },
                     .{ .keys = "j, ↓", .help = "Move down 1 theme." },
                     .{ .keys = "ScrollDown", .help = "Move down 1 theme." },
-                    .{ .keys = "PgDown", .help = "Move down 20 themes." },
+                    .{ .keys = "PgDown, ^D", .help = "Move down 20 themes." },
                     .{ .keys = "h, x", .help = "Show palette numbers in hexadecimal." },
                     .{ .keys = "d", .help = "Show palette numbers in decimal." },
                     .{ .keys = "c", .help = "Copy theme name to the clipboard." },
@@ -785,6 +836,8 @@ const Preview = struct {
                     .{ .keys = "^X, ^/", .help = "Clear search." },
                     .{ .keys = "⏎", .help = "Save theme or close search window." },
                     .{ .keys = "w", .help = "Write theme to auto config file." },
+                    .{ .keys = "c", .help = "Copy config line (on save screen)." },
+                    .{ .keys = "C", .help = "Copy config-file line (on save screen)." },
                 };
 
                 for (key_help, 0..) |help, captured_i| {
@@ -838,7 +891,7 @@ const Preview = struct {
             .save => {
                 const theme = self.themes[self.filtered.items[self.current]];
 
-                const width = 92;
+                const width = 104;
                 const height = 17;
                 const child = win.child(
                     .{
@@ -858,14 +911,31 @@ const Preview = struct {
                 const save_instructions = [_][]const u8{
                     "To apply this theme, add the following line to your Ghostty configuration:",
                     "",
-                    try std.fmt.allocPrint(alloc, "theme = {s}", .{theme.theme}),
+                    try std.fmt.allocPrint(alloc, "theme = {s} [c] copy{s}", .{
+                        theme.theme,
+                        switch (self.copy_status) {
+                            .theme_copied => "  ✓ Copied configuration line",
+                            .theme_failed => "  ✗ Copy failed",
+                            else => "",
+                        },
+                    }),
                     "",
                     "Save the configuration file and then reload it to apply the new theme.",
                     "",
                     "Or press 'w' to write an auto theme file to your system's preferred default config path.",
                     "Then add the following line to your Ghostty configuration and reload:",
                     "",
-                    "config-file = ?auto/theme.ghostty",
+                    try std.fmt.allocPrint(alloc, "config-file = ?auto/theme.ghostty [C] copy  [w] write auto theme file{s}", .{
+                        switch (self.copy_status) {
+                            .config_copied => "  ✓ Copied configuration line",
+                            .config_failed => "  ✗ Copy failed",
+                            else => switch (self.save_status) {
+                                .written => "  ✓ Wrote the auto theme file.",
+                                .write_failed => "  ✗ Write failed",
+                                .none => "",
+                            },
+                        },
+                    }),
                     "",
                     "For more details on configuration and themes, visit the Ghostty documentation:",
                     "",
@@ -1773,8 +1843,10 @@ const Preview = struct {
         const theme = self.themes[idx];
 
         writeAutoThemeFile(self.allocator, theme.theme) catch {
+            self.save_status = .write_failed;
             return;
         };
+        self.save_status = .written;
     }
 };
 
